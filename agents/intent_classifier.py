@@ -1,5 +1,4 @@
 import operator
-from curses import init_color
 from typing import Annotated, Literal, Optional, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
@@ -8,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from models.groq import groq_model
 from prompts.system_prompts import DEEP_RESEARCH_SYSTEM_PROMPT
+import mlflow
 
 
 class ResearchState(TypedDict):
@@ -33,7 +33,6 @@ class ClassificationResponse(BaseModel):
 class CompareSubjects(BaseModel):
     subject_a: str = Field(description="First subject being compared")
     subject_b: str = Field(description="Second subject being compared")
-
 
 def intent_classifier(
     state: ResearchState,
@@ -85,6 +84,10 @@ def intent_classifier(
         }
         goto = intent_map.get(response.intent, "unknown_agent")
         print(f"Routing as: {response.intent} (confidence: {response.confidence}%)")
+
+    # Log routing decision at run level — this is experiment tracking, not a trace span
+    mlflow.log_param("detected_intent", response.intent)
+    mlflow.log_metric("intent_confidence", response.confidence)
 
     return Command(goto=goto)
 
@@ -163,6 +166,7 @@ def sources_agent(state: ResearchState) -> dict:
 def deep_research_agent(state: ResearchState):
     init_messages = [("system", DEEP_RESEARCH_SYSTEM_PROMPT), ("user", state["query"])]
     response = groq_model.use("default").invoke(init_messages)
+    print(f"📝 Generated initial output ({len(response.content)} chars)")
     return Command(
         update={"output": response.content, "reflection_iterations": 0},
         goto="reflect_deep_research",
@@ -173,7 +177,11 @@ def reflect_deep_research(state: ResearchState) -> dict:
     if not state["output"]:
         return Command(update={"reflection_iterations": 0}, goto=END)
     if state["reflection_iterations"] >= 2:
+        print(f"✅ Reflection complete after {state['reflection_iterations']} iterations")
         return Command(update={"reflection_iterations": 0}, goto=END)
+
+    iteration = state["reflection_iterations"] + 1
+    print(f"🔄 Reflection iteration {iteration}/2...")
 
     init_critique_messages = [
         (
@@ -183,6 +191,7 @@ def reflect_deep_research(state: ResearchState) -> dict:
         ("user", state["output"]),
     ]
     critique_response = groq_model.use("cheap").invoke(init_critique_messages)
+
     init_revision_messages = [
         (
             "system",
@@ -191,9 +200,11 @@ def reflect_deep_research(state: ResearchState) -> dict:
         ("user", critique_response.content),
     ]
     revision_response = groq_model.use("default").invoke(init_revision_messages)
+    print(f"📝 Revised output ({len(revision_response.content)} chars)")
+
     return Command(
         update={
-            "reflection_iterations": state["reflection_iterations"] + 1,
+            "reflection_iterations": iteration,
             "output": revision_response.content,
         },
         goto="reflect_deep_research",
